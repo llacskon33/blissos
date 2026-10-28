@@ -1,80 +1,267 @@
-name: Preparar ISO BlissOS
+name: Android
 
 on:
   workflow_dispatch:
     inputs:
-      iso_url:
-        description: "URL directa del ISO (opcional; si la dejas vacía se prueban los mirrors de SourceForge)"
+      vnc:
+        description: "Mostrar la pantalla por VNC (para verla desde el móvil). Si lo desmarcas solo hay ADB/scrcpy."
+        type: boolean
+        default: true
+      escala:
+        description: "Tamaño de la ventana en VNC (0.5 = mitad)"
         type: string
-        default: ""
+        default: "0.5"
+      minutos:
+        description: "Minutos activo antes de la copia final (máx. 315)"
+        type: number
+        default: 315
+      intervalo:
+        description: "Cada cuántos minutos guardar copia"
+        type: number
+        default: 60
+      imagen:
+        description: "Imagen de sistema Android (cámbiala solo si sabes lo que haces)"
+        type: string
+        default: "system-images;android-34;google_apis_playstore;x86_64"
 
 permissions:
   contents: write
 
 env:
+  BACKUP_PREFIX: android-backup-
   GH_REPO: ${{ github.repository }}
   GH_TOKEN: ${{ github.token }}
 
 jobs:
-  iso:
+  android:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     steps:
-      - name: Comprobar si ya hay ISO guardado
+      - name: Preparar KVM y paquetes
         run: |
-          if gh release view iso --json assets --jq '.assets[].name' 2>/dev/null | grep -q '^bliss\.iso'; then
-            echo "SKIP=1" >> "$GITHUB_ENV"
-            echo "## Ya hay un ISO guardado en la Release 'iso'. No hace falta hacer nada." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q socat zstd xvfb x11vnc
+          for p in libpulse0 libnss3 libxkbcommon-x11-0 libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1 libxcomposite1 libxcursor1 libxi6 libxtst6 libxdamage1 libxrandr2 libasound2t64 libasound2 libgl1 libx11-xcb1; do
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$p" >/dev/null 2>&1 || true
+          done
+          ls -l /dev/kvm || echo "::warning::Sin /dev/kvm: el emulador iría muy lento (solo los repos públicos tienen KVM)."
+          echo "JOB_START=$(date -u +%s)" >> "$GITHUB_ENV"
 
-      - name: Descargar el ISO
-        if: env.SKIP != '1'
+      - name: Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: android-${{ github.run_id }}
+
+      - name: IP de Tailscale
+        run: |
+          IP=$(tailscale ip -4 | head -n1)
+          if [ -z "$IP" ]; then echo "::error::Falta TS_AUTHKEY o Tailscale no conectó."; exit 1; fi
+          echo "TS_IP=$IP" >> "$GITHUB_ENV"
+
+      - name: Instalar SDK y emulador de Android
         env:
-          INPUT_URL: ${{ inputs.iso_url }}
+          IMAGEN: ${{ inputs.imagen }}
         run: |
-          mkdir -p "$HOME/iso" && cd "$HOME/iso"
-          F=Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso
-          P=project/blissos-x86/Official/BlissOS16/Gapps/Generic/$F
-          URLS=""
-          [ -n "$INPUT_URL" ] && URLS="$INPUT_URL"
-          URLS="$URLS https://sourceforge.net/projects/blissos-x86/files/Official/BlissOS16/Gapps/Generic/$F/download"
-          for M in netcologne phoenixnap versaweb deac-fra freefr ixpeering onboardcloud nchc jaist kumisystems pilotfiber liquidtelecom altushost-swe gigenet; do
-            URLS="$URLS https://$M.dl.sourceforge.net/$P?viasf=1"
-          done
-          OK=0
-          for U in $URLS; do
-            echo "Probando: $U"
-            if curl -L --fail --connect-timeout 15 --max-time 900 -A "Mozilla/5.0" -o bliss.iso "$U" \
-               && [ "$(stat -c%s bliss.iso)" -gt 1000000000 ]; then
-              OK=1; echo "Descargado desde: $U"; break
-            fi
-            rm -f bliss.iso
-          done
-          if [ "$OK" != 1 ]; then
-            {
-              echo "## No se pudo descargar el ISO desde GitHub"
-              echo "Todos los mirrors probados rechazaron la descarga. Prueba a pasar otra URL directa en el campo iso_url."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::Ningún mirror dejó descargar el ISO desde GitHub."
-            exit 1
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          sudo mkdir -p "$ANDROID_HOME"
+          sudo chown -R "$USER" "$ANDROID_HOME" 2>/dev/null || true
+          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "Descargando cmdline-tools..."
+            curl -fsSL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            mkdir -p /tmp/ct "$ANDROID_HOME/cmdline-tools"
+            unzip -q /tmp/cmdtools.zip -d /tmp/ct
+            rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+            mv /tmp/ct/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
           fi
-          ls -lh bliss.iso
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platform-tools" "emulator" "$IMAGEN"
+          {
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            echo "ANDROID_SDK_ROOT=$ANDROID_HOME"
+          } >> "$GITHUB_ENV"
+          {
+            echo "$ANDROID_HOME/cmdline-tools/latest/bin"
+            echo "$ANDROID_HOME/platform-tools"
+            echo "$ANDROID_HOME/emulator"
+          } >> "$GITHUB_PATH"
 
-      - name: Partir y subir a la Release 'iso'
-        if: env.SKIP != '1'
+      - name: Restaurar o crear el dispositivo
+        env:
+          IMAGEN: ${{ inputs.imagen }}
         run: |
-          cd "$HOME/iso"
-          SIZE=$(stat -c%s bliss.iso)
-          split -b 1900M -d bliss.iso bliss.iso.part
-          rm bliss.iso
-          ls -lh bliss.iso.part*
-          gh release create iso --title iso --notes "ISO de BlissOS 16.9.7 en partes (lo usa el workflow BlissOS)" --latest=false bliss.iso.part* \
-            || { gh release delete iso --yes --cleanup-tag 2>/dev/null; echo "::error::No se pudo crear la Release."; exit 1; }
-          UP=$(gh release view iso --json assets --jq '[.assets[].size]|add')
-          if [ "$UP" != "$SIZE" ]; then
-            gh release delete iso --yes --cleanup-tag
-            echo "::error::El tamaño subido ($UP) no coincide con el del ISO ($SIZE). Release borrada."
+          AVD="$HOME/.android/avd"
+          mkdir -p "$AVD"
+          RESTORED=0
+          COMPLETAS=0
+          for t in $(gh release list --limit 100 --json tagName,createdAt \
+                     --jq "[.[]|select(.tagName|startswith(\"$BACKUP_PREFIX\"))]|sort_by(.createdAt)|reverse|.[].tagName"); do
+            gh release view "$t" --json assets --jq '.assets[].name' | grep -qx complete.flag || continue
+            COMPLETAS=$((COMPLETAS+1))
+            echo "Probando copia $t"
+            rm -rf "$HOME/dl" && mkdir "$HOME/dl"
+            gh release download "$t" --dir "$HOME/dl" --pattern 'avd.tar.zst.part*' || continue
+            rm -rf "$AVD/bliss.avd" "$AVD/bliss.ini"
+            if cat "$HOME"/dl/avd.tar.zst.part* | zstd -dc | tar -xf - -C "$AVD" \
+               && [ -f "$AVD/bliss.ini" ] && [ -d "$AVD/bliss.avd" ]; then
+              RESTORED=1
+              echo "RESTORED_TAG=$t" >> "$GITHUB_ENV"
+              echo "Copia restaurada: $t"
+              break
+            fi
+            echo "::warning::La copia $t no se pudo restaurar; se prueba la anterior."
+          done
+          rm -rf "$HOME/dl"
+
+          if [ "$RESTORED" = 0 ] && [ "$COMPLETAS" -gt 0 ]; then
+            echo "::error::Hay copias guardadas pero ninguna se pudo restaurar. Se detiene para no pisarlas."
             exit 1
           fi
-          echo "## ISO guardado en la Release 'iso' ($SIZE bytes). Ya puedes lanzar el workflow BlissOS." >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$RESTORED" = 0 ]; then
+            echo "Primera ejecución: creando el dispositivo."
+            echo no | avdmanager create avd -n bliss -k "$IMAGEN" -d pixel_6 --force
+            CFG="$AVD/bliss.avd/config.ini"
+            setcfg() { if grep -q "^$1=" "$CFG"; then sed -i "s|^$1=.*|$1=$2|" "$CFG"; else echo "$1=$2" >> "$CFG"; fi; }
+            setcfg disk.dataPartition.size 16G
+            setcfg hw.keyboard yes
+          fi
+          echo "RESTORE_OK=1" >> "$GITHUB_ENV"
+
+      - name: Arrancar Android
+        env:
+          VNC: ${{ inputs.vnc }}
+          ESCALA: ${{ inputs.escala }}
+        run: |
+          cd "$HOME"
+          COMMON="-avd bliss -port 5554 -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 4096 -cores 4 -netdelay none -netspeed full"
+          MODE=headless
+          if [ "$VNC" = "true" ]; then
+            Xvfb :99 -screen 0 1400x1000x24 > xvfb.log 2>&1 &
+            sleep 2
+            DISPLAY=:99 nohup emulator $COMMON -scale "$ESCALA" > emu.log 2>&1 &
+            sleep 45
+            if pgrep -f "avd bliss" > /dev/null; then
+              MODE=gui
+            else
+              echo "::warning::El emulador con ventana no arrancó; se usa el modo sin pantalla (solo ADB)."
+              tail -n 30 emu.log || true
+              pkill Xvfb || true
+            fi
+          fi
+          if [ "$MODE" = headless ]; then
+            nohup emulator $COMMON -no-window > emu.log 2>&1 &
+            sleep 30
+            if ! pgrep -f "avd bliss" > /dev/null; then
+              echo "::error::El emulador no arrancó."
+              cat emu.log
+              exit 1
+            fi
+          fi
+          echo "MODE=$MODE" >> "$GITHUB_ENV"
+
+          if [ "$MODE" = gui ]; then
+            x11vnc -display :99 -forever -shared -nopw -noxdamage -rfbport 5900 -listen "$TS_IP" -bg -o "$HOME/x11vnc.log"
+          fi
+
+          timeout 300 adb wait-for-device || echo "::warning::adb no vio el dispositivo a tiempo."
+          for i in $(seq 1 120); do
+            if [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then echo "Android arrancado."; break; fi
+            sleep 5
+          done
+
+          nohup socat TCP-LISTEN:5555,bind="$TS_IP",fork,reuseaddr TCP:127.0.0.1:5555 > socat.log 2>&1 &
+          sleep 2
+          pgrep -a socat || echo "::warning::socat no arrancó: ADB no será accesible por Tailscale."
+
+      - name: Datos de conexión
+        run: |
+          {
+            echo "## Android (emulador oficial de Google)"
+            echo "- Necesitas Tailscale activo en tu móvil o PC."
+            echo "- ADB: \`adb connect $TS_IP:5555\` y luego \`scrcpy -s $TS_IP:5555\` (el más fluido, desde un PC)."
+            if [ "$MODE" = gui ]; then
+              echo "- VNC (para el móvil): cliente VNC a \`$TS_IP:5900\`, sin contraseña."
+            else
+              echo "- Modo sin pantalla: solo ADB/scrcpy (no hay VNC)."
+            fi
+            echo "- Tiene Play Store: inicia sesión con tu cuenta de Google y queda guardado en la copia."
+            echo "- Se termina solo al llegar al plazo."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sesión con copias periódicas
+        env:
+          MINUTOS: ${{ inputs.minutos }}
+          INTERVALO: ${{ inputs.intervalo }}
+        run: |
+          MIN=$(( MINUTOS > 315 ? 315 : (MINUTOS < 1 ? 1 : MINUTOS) ))
+          INT=$(( INTERVALO < 1 ? 1 : INTERVALO ))
+          NOW=$(date +%s)
+          DEADLINE=$(( NOW + MIN*60 ))
+          LIMIT=$(( JOB_START + 350*60 ))
+          [ $DEADLINE -gt $LIMIT ] && DEADLINE=$LIMIT
+          ADB="adb -s emulator-5554"
+
+          backup() {
+            LIVE="$1"
+            echo "$(date +%T) Copia de seguridad ($LIVE)..."
+            PAUSED=0
+            if [ "$LIVE" = live ]; then
+              $ADB shell sync >/dev/null 2>&1 || true
+              $ADB emu avd stop >/dev/null 2>&1 && PAUSED=1
+              sleep 2
+            fi
+            rm -rf "$HOME/out" && mkdir -p "$HOME/out"
+            (
+              cd "$HOME/.android/avd"
+              tar -S -cf - --exclude='*.lock' --exclude='snapshots' bliss.avd bliss.ini 2>/dev/null \
+                | zstd -T0 -3 \
+                | split -b 1900M -d - "$HOME/out/avd.tar.zst.part"
+              P=("${PIPESTATUS[@]}")
+              # tar devuelve 1 si un archivo cambió mientras se leía (normal en copias en vivo)
+              [ "${P[0]}" -le 1 ] && [ "${P[1]}" -eq 0 ] && [ "${P[2]}" -eq 0 ]
+            )
+            RC=$?
+            [ "$PAUSED" = 1 ] && $ADB emu avd start >/dev/null 2>&1
+            if [ $RC -ne 0 ] || ! ls "$HOME"/out/avd.tar.zst.part* >/dev/null 2>&1; then
+              echo "Fallo al empaquetar el dispositivo."; return 1
+            fi
+            ls -lh "$HOME"/out/
+            TAG="${BACKUP_PREFIX}$(date +%Y%m%d-%H%M%S)"
+            gh release create "$TAG" --title "$TAG" --notes "Copia automática del emulador Android" --latest=false || return 1
+            if ! gh release upload "$TAG" "$HOME"/out/avd.tar.zst.part* --clobber; then
+              gh release delete "$TAG" --yes --cleanup-tag; return 1
+            fi
+            echo ok > "$HOME/out/complete.flag"
+            gh release upload "$TAG" "$HOME/out/complete.flag" || { gh release delete "$TAG" --yes --cleanup-tag; return 1; }
+            # Conservar las 2 copias más recientes
+            for o in $(gh release list --limit 100 --json tagName,createdAt \
+                       --jq "[.[]|select(.tagName|startswith(\"$BACKUP_PREFIX\"))]|sort_by(.createdAt)|reverse|.[2:][].tagName"); do
+              gh release delete "$o" --yes --cleanup-tag
+            done
+            rm -rf "$HOME/out"
+            echo "Copia guardada: $TAG"
+          }
+
+          LAST=$NOW
+          while [ "$(date +%s)" -lt $DEADLINE ]; do
+            sleep 60
+            pgrep -f "avd bliss" >/dev/null || { echo "El emulador se cerró (apagado desde Android)."; break; }
+            if [ $(( $(date +%s) - LAST )) -ge $(( INT*60 )) ] && [ "$(date +%s)" -lt $DEADLINE ]; then
+              backup live || echo "::warning::La copia periódica falló; se conserva la anterior."
+              LAST=$(date +%s)
+            fi
+          done
+
+          echo "== Apagado y copia final =="
+          if pgrep -f "avd bliss" >/dev/null; then
+            $ADB shell reboot -p >/dev/null 2>&1 || true
+            for i in $(seq 1 24); do pgrep -f "avd bliss" >/dev/null || break; sleep 5; done
+            pgrep -f "avd bliss" >/dev/null && { $ADB emu kill >/dev/null 2>&1 || true; sleep 10; }
+          fi
+          backup final || { echo "::error::La copia final falló; se conserva la anterior."; exit 1; }
