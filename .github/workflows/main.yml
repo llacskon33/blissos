@@ -26,6 +26,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 env:
   BACKUP_PREFIX: android-backup-
@@ -40,6 +41,7 @@ jobs:
     steps:
       - name: Preparar KVM y paquetes
         run: |
+          exec > >(tee -a "$HOME/run.log") 2>&1
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
@@ -59,6 +61,7 @@ jobs:
 
       - name: IP de Tailscale
         run: |
+          exec > >(tee -a "$HOME/run.log") 2>&1
           IP=$(tailscale ip -4 | head -n1)
           if [ -z "$IP" ]; then echo "::error::Falta TS_AUTHKEY o Tailscale no conectó."; exit 1; fi
           echo "TS_IP=$IP" >> "$GITHUB_ENV"
@@ -67,6 +70,7 @@ jobs:
         env:
           IMAGEN: ${{ inputs.imagen }}
         run: |
+          exec > >(tee -a "$HOME/run.log") 2>&1
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           sudo mkdir -p "$ANDROID_HOME"
           sudo chown -R "$USER" "$ANDROID_HOME" 2>/dev/null || true
@@ -95,8 +99,12 @@ jobs:
         env:
           IMAGEN: ${{ inputs.imagen }}
         run: |
+          exec > >(tee -a "$HOME/run.log") 2>&1
           AVD="$HOME/.android/avd"
           mkdir -p "$AVD"
+          # Forzar la carpeta de dispositivos: avdmanager y el emulador pueden usar otra por defecto
+          export ANDROID_AVD_HOME="$AVD"
+          echo "ANDROID_AVD_HOME=$AVD" >> "$GITHUB_ENV"
           RESTORED=0
           COMPLETAS=0
           for t in $(gh release list --limit 100 --json tagName,createdAt \
@@ -127,6 +135,12 @@ jobs:
             echo "Primera ejecución: creando el dispositivo."
             echo no | avdmanager create avd -n bliss -k "$IMAGEN" -d pixel_6 --force
             CFG="$AVD/bliss.avd/config.ini"
+            if [ ! -f "$CFG" ]; then
+              echo "::error::avdmanager no creó el dispositivo en $AVD. Dónde lo dejó:"
+              avdmanager list avd || true
+              find "$HOME" -maxdepth 6 -name config.ini -path '*bliss*' 2>/dev/null || true
+              exit 1
+            fi
             setcfg() { if grep -q "^$1=" "$CFG"; then sed -i "s|^$1=.*|$1=$2|" "$CFG"; else echo "$1=$2" >> "$CFG"; fi; }
             setcfg disk.dataPartition.size 16G
             setcfg hw.keyboard yes
@@ -138,6 +152,7 @@ jobs:
           VNC: ${{ inputs.vnc }}
           ESCALA: ${{ inputs.escala }}
         run: |
+          exec > >(tee -a "$HOME/run.log") 2>&1
           cd "$HOME"
           COMMON="-avd bliss -port 5554 -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 4096 -cores 4 -netdelay none -netspeed full"
           MODE=headless
@@ -181,6 +196,7 @@ jobs:
 
       - name: Datos de conexión
         run: |
+          exec > >(tee -a "$HOME/run.log") 2>&1
           {
             echo "## Android (emulador oficial de Google)"
             echo "- Necesitas Tailscale activo en tu móvil o PC."
@@ -199,6 +215,7 @@ jobs:
           MINUTOS: ${{ inputs.minutos }}
           INTERVALO: ${{ inputs.intervalo }}
         run: |
+          exec > >(tee -a "$HOME/run.log") 2>&1
           MIN=$(( MINUTOS > 315 ? 315 : (MINUTOS < 1 ? 1 : MINUTOS) ))
           INT=$(( INTERVALO < 1 ? 1 : INTERVALO ))
           NOW=$(date +%s)
@@ -265,3 +282,27 @@ jobs:
             pgrep -f "avd bliss" >/dev/null && { $ADB emu kill >/dev/null 2>&1 || true; sleep 10; }
           fi
           backup final || { echo "::error::La copia final falló; se conserva la anterior."; exit 1; }
+
+      - name: Diagnóstico (solo si algo falla)
+        if: failure()
+        run: |
+          sleep 2
+          {
+            echo "## Qué falló"
+            gh run view "$GITHUB_RUN_ID" --json jobs --jq '.jobs[].steps[] | select(.conclusion=="failure") | "- Paso: **" + .name + "**"' 2>/dev/null || echo "- (no se pudo consultar el paso)"
+            echo
+            echo "### Últimas líneas del log"
+            echo '```'
+            tail -n 60 "$HOME/run.log" 2>/dev/null | cut -c1-300
+            echo '```'
+            if [ -f "$HOME/emu.log" ]; then
+              echo "### emu.log (emulador)"
+              echo '```'
+              tail -n 40 "$HOME/emu.log" | cut -c1-300
+              echo '```'
+            fi
+            echo "### KVM"
+            echo '```'
+            ls -l /dev/kvm 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
