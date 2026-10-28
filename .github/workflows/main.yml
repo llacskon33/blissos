@@ -1,0 +1,80 @@
+name: Preparar ISO BlissOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: "URL directa del ISO (opcional; si la dejas vacía se prueban los mirrors de SourceForge)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  GH_REPO: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  iso:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Comprobar si ya hay ISO guardado
+        run: |
+          if gh release view iso --json assets --jq '.assets[].name' 2>/dev/null | grep -q '^bliss\.iso'; then
+            echo "SKIP=1" >> "$GITHUB_ENV"
+            echo "## Ya hay un ISO guardado en la Release 'iso'. No hace falta hacer nada." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Descargar el ISO
+        if: env.SKIP != '1'
+        env:
+          INPUT_URL: ${{ inputs.iso_url }}
+        run: |
+          mkdir -p "$HOME/iso" && cd "$HOME/iso"
+          F=Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso
+          P=project/blissos-x86/Official/BlissOS16/Gapps/Generic/$F
+          URLS=""
+          [ -n "$INPUT_URL" ] && URLS="$INPUT_URL"
+          URLS="$URLS https://sourceforge.net/projects/blissos-x86/files/Official/BlissOS16/Gapps/Generic/$F/download"
+          for M in netcologne phoenixnap versaweb deac-fra freefr ixpeering onboardcloud nchc jaist kumisystems pilotfiber liquidtelecom altushost-swe gigenet; do
+            URLS="$URLS https://$M.dl.sourceforge.net/$P?viasf=1"
+          done
+          OK=0
+          for U in $URLS; do
+            echo "Probando: $U"
+            if curl -L --fail --connect-timeout 15 --max-time 900 -A "Mozilla/5.0" -o bliss.iso "$U" \
+               && [ "$(stat -c%s bliss.iso)" -gt 1000000000 ]; then
+              OK=1; echo "Descargado desde: $U"; break
+            fi
+            rm -f bliss.iso
+          done
+          if [ "$OK" != 1 ]; then
+            {
+              echo "## No se pudo descargar el ISO desde GitHub"
+              echo "Todos los mirrors probados rechazaron la descarga. Prueba a pasar otra URL directa en el campo iso_url."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Ningún mirror dejó descargar el ISO desde GitHub."
+            exit 1
+          fi
+          ls -lh bliss.iso
+
+      - name: Partir y subir a la Release 'iso'
+        if: env.SKIP != '1'
+        run: |
+          cd "$HOME/iso"
+          SIZE=$(stat -c%s bliss.iso)
+          split -b 1900M -d bliss.iso bliss.iso.part
+          rm bliss.iso
+          ls -lh bliss.iso.part*
+          gh release create iso --title iso --notes "ISO de BlissOS 16.9.7 en partes (lo usa el workflow BlissOS)" --latest=false bliss.iso.part* \
+            || { gh release delete iso --yes --cleanup-tag 2>/dev/null; echo "::error::No se pudo crear la Release."; exit 1; }
+          UP=$(gh release view iso --json assets --jq '[.assets[].size]|add')
+          if [ "$UP" != "$SIZE" ]; then
+            gh release delete iso --yes --cleanup-tag
+            echo "::error::El tamaño subido ($UP) no coincide con el del ISO ($SIZE). Release borrada."
+            exit 1
+          fi
+          echo "## ISO guardado en la Release 'iso' ($SIZE bytes). Ya puedes lanzar el workflow BlissOS." >> "$GITHUB_STEP_SUMMARY"
